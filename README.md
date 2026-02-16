@@ -136,6 +136,7 @@ chmod +x modbus_tool.py
 ### Custom Packet
 - Function Code: Custom
 - Custom Packet: `01 03 00 00 00 0A` (CRC will be added automatically)
+- This reads 10 holding registers starting at address 0 from slave 1
 
 ## License
 
