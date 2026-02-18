@@ -479,8 +479,9 @@ class ModbusRTUTool(QMainWindow):
             'Hex (default)',
             'Hex + Decimal',
             'Hex + ASCII',
+            'Hex + Binary',
             'Decimal only',
-            'Binary'
+            'Binary only'
         ])
         self.monitor_format_combo.setCurrentIndex(0)
         format_layout.addWidget(self.monitor_format_combo)
@@ -666,36 +667,12 @@ class ModbusRTUTool(QMainWindow):
         if len(packet) < 4:
             return  # Too short to be valid
         
-        # Check if this might be concatenated packets (request + response)
-        # Look for patterns like: [req with CRC] [resp with CRC] both starting with same slave ID
-        packets_to_process = []
+        # Check if this might be concatenated packets
+        packets_to_process = self.split_concatenated_packets(packet)
         
-        # Try to split if we see duplicate slave IDs and valid CRC boundaries
-        if len(packet) > 8:  # Long enough to potentially be 2 packets
-            # Try to find valid CRC boundaries
-            for split_point in range(4, len(packet) - 3):
-                packet1 = packet[:split_point]
-                packet2 = packet[split_point:]
-                
-                if len(packet1) >= 4 and len(packet2) >= 4:
-                    # Check if both have valid CRCs
-                    crc1_data = packet1[:-2]
-                    crc1_received = packet1[-2:]
-                    crc1_calc = self.calculate_crc(crc1_data)
-                    
-                    crc2_data = packet2[:-2]
-                    crc2_received = packet2[-2:]
-                    crc2_calc = self.calculate_crc(crc2_data)
-                    
-                    if crc1_received == crc1_calc and crc2_received == crc2_calc:
-                        # Both parts have valid CRCs - this is concatenated packets
-                        packets_to_process = [packet1, packet2]
-                        self.log_message('📡 Concatenated packets detected - splitting...')
-                        break
-        
-        # If we didn't split, process as single packet
-        if not packets_to_process:
-            packets_to_process = [packet]
+        # If we split packets, log it
+        if len(packets_to_process) > 1:
+            self.log_message('📡 Concatenated packets detected - splitting...')
         
         # Process each packet
         for pkt in packets_to_process:
@@ -805,15 +782,16 @@ class ModbusRTUTool(QMainWindow):
                         for byte in response_data[:byte_count]:
                             for i in range(8):
                                 bits.append((byte >> i) & 1)
-                        self.log_message(f'   Values: {bits[:byte_count*8]}')
+                        formatted_bits = self.format_decoded_values(bits[:byte_count*8], 'coil')
+                        self.log_message(f'   Values: {formatted_bits}')
                     elif base_func_code in [3, 4]:  # Registers
                         registers = []
                         for i in range(0, min(byte_count, len(response_data)), 2):
                             if i+1 < len(response_data):
                                 reg = struct.unpack('>H', response_data[i:i+2])[0]
                                 registers.append(reg)
-                        self.log_message(f'   Registers: {registers}')
-                        self.log_message(f'   Hex: {[f"0x{r:04X}" for r in registers]}')
+                        formatted_regs = self.format_decoded_values(registers, 'register')
+                        self.log_message(f'   Registers: {formatted_regs}')
         
         elif base_func_code in [5, 6]:  # Write single
             # Extended addressing changes format
@@ -864,7 +842,8 @@ class ModbusRTUTool(QMainWindow):
                         if i+1 < len(write_data):
                             reg = struct.unpack('>H', write_data[i:i+2])[0]
                             registers.append(reg)
-                    self.log_message(f'   Values: {registers}')
+                    formatted_regs = self.format_decoded_values(registers, 'register')
+                    self.log_message(f'   Values: {formatted_regs}')
             elif len(data) > 6:  # Has data field (potential request)
                 # Try standard format first (most common)
                 addr_std = struct.unpack('>H', data[2:4])[0]
@@ -899,7 +878,8 @@ class ModbusRTUTool(QMainWindow):
                             if i+1 < len(write_data):
                                 reg = struct.unpack('>H', write_data[i:i+2])[0]
                                 registers.append(reg)
-                        self.log_message(f'   Values: {registers}')
+                        formatted_regs = self.format_decoded_values(registers, 'register')
+                        self.log_message(f'   Values: {formatted_regs}')
                 else:
                     # Try split addressing (extended)
                     if len(data) >= 9:  # Need at least addr_h + addr_l + qty + byte_count
@@ -932,7 +912,8 @@ class ModbusRTUTool(QMainWindow):
                                     if i+1 < len(write_data):
                                         reg = struct.unpack('>H', write_data[i:i+2])[0]
                                         registers.append(reg)
-                                self.log_message(f'   Values: {registers}')
+                                formatted_regs = self.format_decoded_values(registers, 'register')
+                                self.log_message(f'   Values: {formatted_regs}')
                         else:
                             # Can't determine format reliably
                             self.log_message(f'   Type: Write Multiple (format unclear)')
@@ -1014,12 +995,111 @@ class ModbusRTUTool(QMainWindow):
         elif format_mode == 2:  # Hex + ASCII
             ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in packet)
             return f'{hex_str}\n       ASCII: {ascii_str}'
-        elif format_mode == 3:  # Decimal only
+        elif format_mode == 3:  # Hex + Binary
+            bin_str = ' '.join(f'{b:08b}' for b in packet)
+            return f'{hex_str}\n       BIN: {bin_str}'
+        elif format_mode == 4:  # Decimal only
             return ' '.join(f'{b:3d}' for b in packet)
-        elif format_mode == 4:  # Binary
+        elif format_mode == 5:  # Binary only
             return ' '.join(f'{b:08b}' for b in packet)
         
         return hex_str  # Fallback
+    
+    def split_concatenated_packets(self, data):
+        """Split concatenated packets by finding valid CRC boundaries"""
+        if len(data) < 4:
+            return [data] if data else []
+        
+        packets = []
+        
+        # Try to find valid CRC boundaries
+        for split_point in range(4, len(data) - 3):
+            packet1 = data[:split_point]
+            packet2 = data[split_point:]
+            
+            if len(packet1) >= 4 and len(packet2) >= 4:
+                # Check if both have valid CRCs
+                crc1_data = packet1[:-2]
+                crc1_received = packet1[-2:]
+                crc1_calc = self.calculate_crc(crc1_data)
+                
+                crc2_data = packet2[:-2]
+                crc2_received = packet2[-2:]
+                crc2_calc = self.calculate_crc(crc2_data)
+                
+                if crc1_received == crc1_calc and crc2_received == crc2_calc:
+                    # Both parts have valid CRCs - recursively split packet2 in case there are more
+                    remaining = self.split_concatenated_packets(packet2)
+                    return [packet1] + remaining
+        
+        # No split found, check if single packet is valid
+        if len(data) >= 4:
+            crc_data = data[:-2]
+            crc_received = data[-2:]
+            crc_calc = self.calculate_crc(crc_data)
+            
+            if crc_received == crc_calc:
+                return [data]
+        
+        # Return as-is if we can't validate
+        return [data]
+    
+    def format_decoded_values(self, values, value_type='register'):
+        """Format decoded register/coil values based on user selection
+        
+        Args:
+            values: List of integer values (registers or coils)
+            value_type: 'register' for 16-bit values, 'coil' for boolean values
+        """
+        format_mode = self.monitor_format_combo.currentIndex()
+        
+        if format_mode == 0:  # Hex (default) - show both decimal and hex
+            if value_type == 'register':
+                return f'{values}\n       Hex: {[f"0x{v:04X}" for v in values]}'
+            else:  # coils
+                return str(values)
+        
+        elif format_mode == 1:  # Hex + Decimal - show all three
+            if value_type == 'register':
+                hex_vals = [f"0x{v:04X}" for v in values]
+                return f'Dec: {values}\n       Hex: {hex_vals}'
+            else:
+                return str(values)
+        
+        elif format_mode == 2:  # Hex + ASCII - show hex and ASCII interpretation
+            if value_type == 'register':
+                hex_vals = [f"0x{v:04X}" for v in values]
+                # Convert 16-bit values to ASCII (high byte, low byte)
+                ascii_chars = []
+                for v in values:
+                    high = (v >> 8) & 0xFF
+                    low = v & 0xFF
+                    high_char = chr(high) if 32 <= high < 127 else '.'
+                    low_char = chr(low) if 32 <= low < 127 else '.'
+                    ascii_chars.append(f'{high_char}{low_char}')
+                return f'{values}\n       Hex: {hex_vals}\n       ASCII: {"".join(ascii_chars)}'
+            else:
+                return str(values)
+        
+        elif format_mode == 3:  # Hex + Binary
+            if value_type == 'register':
+                hex_vals = [f"0x{v:04X}" for v in values]
+                bin_vals = [f'{v:016b}' for v in values]
+                return f'{values}\n       Hex: {hex_vals}\n       Bin: {bin_vals}'
+            else:
+                return str(values)
+        
+        elif format_mode == 4:  # Decimal only
+            return str(values)
+        
+        elif format_mode == 5:  # Binary only
+            if value_type == 'register':
+                bin_vals = [f'{v:016b}' for v in values]
+                return f'{values}\n       Bin: {bin_vals}'
+            else:
+                return str(values)
+        
+        return str(values)  # Fallback
     
     def calculate_crc(self, data):
         """Calculate Modbus CRC16"""
@@ -1295,22 +1375,43 @@ class ModbusRTUTool(QMainWindow):
                 response = self.serial_port.read(256)
                 
                 if response:
-                    formatted_response = self.format_packet_data(response)
-                    direction_label = 'RX (RTU): ' if self.show_direction.isChecked() else ''
-                    self.log_message(f'{direction_label}{formatted_response}')
+                    # Check for concatenated packets and filter for our slave ID
+                    target_slave = self.slave_id.value()
+                    packets = self.split_concatenated_packets(bytes(response))
                     
-                    # Verify CRC
-                    if len(response) >= 3:
-                        data = response[:-2]
-                        received_crc = response[-2:]
-                        calculated_crc = self.calculate_crc(data)
+                    # Find response from our target slave
+                    our_response = None
+                    for pkt in packets:
+                        if len(pkt) >= 1 and pkt[0] == target_slave:
+                            our_response = pkt
+                            break
+                    
+                    if our_response:
+                        formatted_response = self.format_packet_data(our_response)
+                        direction_label = 'RX (RTU): ' if self.show_direction.isChecked() else ''
+                        self.log_message(f'{direction_label}{formatted_response}')
                         
-                        if received_crc == calculated_crc:
-                            self.log_message('✓ CRC Valid')
-                            # Remove slave ID for decoding (make it look like TCP response)
-                            self.decode_response(response[1:-2], response[0])
-                        else:
-                            self.log_message(f'✗ CRC Error - Expected: {calculated_crc.hex().upper()}, Got: {received_crc.hex().upper()}')
+                        # Verify CRC
+                        if len(our_response) >= 3:
+                            data = our_response[:-2]
+                            received_crc = our_response[-2:]
+                            calculated_crc = self.calculate_crc(data)
+                            
+                            if received_crc == calculated_crc:
+                                self.log_message('✓ CRC Valid')
+                                # Remove slave ID for decoding (make it look like TCP response)
+                                self.decode_response(our_response[1:-2], our_response[0])
+                            else:
+                                self.log_message(f'✗ CRC Error - Expected: {calculated_crc.hex().upper()}, Got: {received_crc.hex().upper()}')
+                    else:
+                        # Show all packets but indicate none match our request
+                        if len(packets) > 1:
+                            self.log_message(f'⚠ Received {len(packets)} packets, but none from target slave {target_slave}:')
+                        for pkt in packets:
+                            formatted_pkt = self.format_packet_data(pkt)
+                            slave = pkt[0] if len(pkt) > 0 else 0
+                            self.log_message(f'  Slave {slave}: {formatted_pkt}')
+                        self.log_message('No response from target slave (other traffic on bus)')
                 else:
                     self.log_message('No response received (timeout)')
                     
@@ -1421,7 +1522,8 @@ class ModbusRTUTool(QMainWindow):
             for byte in data:
                 for i in range(8):
                     bits.append((byte >> i) & 1)
-            self.log_message(f'  Coils/Inputs: {bits[:byte_count*8]}')
+            formatted_bits = self.format_decoded_values(bits[:byte_count*8], 'coil')
+            self.log_message(f'  Coils/Inputs: {formatted_bits}')
             
         elif func in [3, 4]:  # Read holding/input registers
             byte_count = pdu[1]
@@ -1430,8 +1532,8 @@ class ModbusRTUTool(QMainWindow):
             for i in range(0, len(data), 2):
                 reg_value = struct.unpack('>H', data[i:i+2])[0]
                 registers.append(reg_value)
-            self.log_message(f'  Registers: {registers}')
-            self.log_message(f'  Hex: {[f"0x{r:04X}" for r in registers]}')
+            formatted_regs = self.format_decoded_values(registers, 'register')
+            self.log_message(f'  Registers: {formatted_regs}')
             
         elif func in [5, 6, 15, 16]:  # Write confirmation
             addr = struct.unpack('>H', pdu[1:3])[0]
